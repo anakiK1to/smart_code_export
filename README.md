@@ -1,4 +1,3 @@
-````markdown
 # Code Export CLI 🛠️
 
 <img src="https://img.shields.io/badge/python-3.8+-blue?logo=python" alt="Python 3.8+"> <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
@@ -26,8 +25,6 @@
 ```bash
 pip install -r requirements.txt
 ```
-````
-
 ## 🚀 Быстрый старт
 
 ```bash
