@@ -1,3 +1,4 @@
+
 import json
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -7,22 +8,60 @@ import logging
 import logging.config
 import os
 import mimetypes
+import getpass
 
 # Настройка логирования
-logging.config.fileConfig('logging.ini')
+logging.config.dictConfig({
+    'version': 1,
+    'formatters': {
+        'simple': {
+            'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            'datefmt': '%Y-%m-%d %H:%M:%S'
+        }
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'level': 'DEBUG',
+            'formatter': 'simple',
+            'stream': 'ext://sys.stdout'
+        },
+        'file': {
+            'class': 'logging.FileHandler',
+            'level': 'DEBUG',
+            'formatter': 'simple',
+            'filename': 'code_export.log',
+            'encoding': 'utf-8'
+        }
+    },
+    'loggers': {
+        '__main__': {
+            'level': 'DEBUG',
+            'handlers': ['console', 'file'],
+            'propagate': False
+        }
+    }
+})
 logger = logging.getLogger(__name__)
 
 # Константы
 CONFIG_FILE = Path.home() / ".code_export_configs.json"
-DEFAULT_SCAN_DIRS = ["~/projects", "~/Dev", "~/work", "~/code"]
+USER_HOME = Path.home()
+DEFAULT_SCAN_DIRS = [
+    str(USER_HOME / "Projects"),
+    str(USER_HOME / "Dev"),
+    str(USER_HOME / "Work"),
+    str(USER_HOME / "Code"),
+    str(Path.cwd())
+]
 
 # Дефолтные настройки
 DEFAULT_CONFIGS = {
     "stacks": {
         "React + TypeScript (Vite)": {
-            "extensions": [".ts", ".tsx", ".js", ".jsx", ".css", ".scss", ".html", ".json"],
+            "extensions": [".ts", ".tsx", ".js", ".jsx", ".css", ".scss", ".html", ".json", ".d.ts"],
             "exclude_dirs": ["node_modules", "dist", ".git", ".vite"],
-            "signature_files": ["vite.config.ts", "package.json"],
+            "signature_files": ["vite.config.ts", "vite.config.js", "package.json"],
             "projects": {}
         },
         "Python (Django)": {
@@ -85,22 +124,39 @@ def detect_stack(project_path: Path, configs: Dict) -> Optional[str]:
     for stack_name, stack_config in configs["stacks"].items():
         for sig_file in stack_config.get("signature_files", []):
             if (project_path / sig_file).exists():
+                logger.debug(f"Обнаружен сигнатурный файл {sig_file} в {project_path}")
                 return stack_name
+    logger.debug(f"Сигнатурные файлы не найдены в {project_path}")
     return None
 
-def find_projects(configs: Dict) -> Dict[str, Dict[str, str]]:
-    """Автопоиск проектов"""
+def find_projects(configs: Dict, max_depth: int = 2) -> Dict[str, Dict[str, str]]:
+    """Автопоиск проектов с поддержкой вложенных директорий"""
     found_projects = {}
     for base_dir in configs.get("scan_dirs", DEFAULT_SCAN_DIRS):
         expanded_dir = Path(base_dir).expanduser().resolve()
+        logger.info(f"Сканирование директории: {expanded_dir}")
         if not expanded_dir.exists():
+            logger.warning(f"Директория не существует: {expanded_dir}")
             continue
 
-        for item in expanded_dir.iterdir():
-            if item.is_dir():
-                stack_name = detect_stack(item, configs)
+        try:
+            for root, dirs, files in os.walk(expanded_dir):
+                current_depth = len(Path(root).relative_to(expanded_dir).parts)
+                if current_depth > max_depth:
+                    dirs[:] = []
+                    continue
+                project_path = Path(root)
+                logger.debug(f"Проверка директории: {project_path}, файлы: {files}")
+                stack_name = detect_stack(project_path, configs)
                 if stack_name:
-                    found_projects.setdefault(stack_name, {})[item.name] = str(item)
+                    logger.info(f"Обнаружен проект: {project_path.name} (стек: {stack_name})")
+                    found_projects.setdefault(stack_name, {})[project_path.name] = str(project_path)
+        except Exception as e:
+            logger.error(f"Ошибка при сканировании {expanded_dir}: {e}")
+    if not found_projects:
+        logger.info("Проекты не найдены в указанных директориях")
+    else:
+        logger.info(f"Найдено проектов: {sum(len(projects) for projects in found_projects.values())}")
     return found_projects
 
 def build_project_tree(project_path: Path, extensions: List[str], exclude_dirs: List[str], max_depth: int = None) -> List[Dict]:
@@ -111,7 +167,7 @@ def build_project_tree(project_path: Path, extensions: List[str], exclude_dirs: 
     def scan_directory(path: Path, depth: int = 0) -> List[Dict]:
         items = []
         try:
-            for item in sorted(path.iterdir()):  # Сортировка для предсказуемого порядка
+            for item in sorted(path.iterdir()):
                 if item.name.lower() in [d.lower() for d in exclude_dirs]:
                     continue
                 relative_path = str(item.relative_to(project_path))
@@ -124,12 +180,10 @@ def build_project_tree(project_path: Path, extensions: List[str], exclude_dirs: 
                     })
                     items.extend(scan_directory(item, depth + 1))
                 elif item.is_file and any(item.name.lower().endswith(ext.lower()) for ext in extensions):
-                    mime_type, _ = mimetypes.guess_type(item)
-                    if mime_type and mime_type.startswith('text'):
-                        items.append({
-                            "name": f"📄 {relative_path}",
-                            "value": {"type": "file", "path": str(item), "relative": relative_path}
-                        })
+                    items.append({
+                        "name": f"📄 {relative_path}",
+                        "value": {"type": "file", "path": str(item), "relative": relative_path}
+                    })
         except Exception as e:
             logger.warning(f"Ошибка при сканировании {path}: {e}")
         return items
@@ -155,7 +209,6 @@ def export_project_code(project_path: str, extensions: List[str], exclude_dirs: 
                 logger.debug(f"Обрабатывается директория: {root}")
                 logger.debug(f"Директории после фильтрации: {dirs}")
 
-                # Проверка уровня вложенности
                 relative_root = Path(root).relative_to(project_path)
                 current_depth = len(relative_root.parts)
                 if max_depth is not None and current_depth > max_depth:
@@ -165,20 +218,13 @@ def export_project_code(project_path: str, extensions: List[str], exclude_dirs: 
                     file_path = Path(root) / file
                     relative_path = file_path.relative_to(project_path)
 
-                    # Проверка выбранных путей
                     if selected_paths and str(relative_path) not in selected_paths:
-                        continue
-
-                    # Проверка размера файла
-                    if file_path.stat().st_size > MAX_FILE_SIZE:
-                        logger.warning(f"Пропущен файл из-за большого размера: {relative_path}")
+                        logger.debug(f"Пропущен файл (не в выбранных путях): {relative_path}")
                         skipped_files.append(str(relative_path))
                         continue
 
-                    # Проверка типа файла
-                    mime_type, _ = mimetypes.guess_type(file_path)
-                    if mime_type and not mime_type.startswith('text'):
-                        logger.warning(f"Пропущен файл (не текстовый): {relative_path}")
+                    if file_path.stat().st_size > MAX_FILE_SIZE:
+                        logger.warning(f"Пропущен файл из-за большого размера: {relative_path}")
                         skipped_files.append(str(relative_path))
                         continue
 
@@ -304,16 +350,21 @@ async def edit_stack_config(configs: Dict, stack_name: str) -> Dict:
 
 async def edit_stack(configs: Dict, stack_name: str) -> Dict:
     """Редактирование стека (проекты и конфигурация)"""
+    if stack_name not in configs["stacks"]:
+        logger.error(f"Стек '{stack_name}' не существует")
+        print(f"⚠️ Стек '{stack_name}' не существует")
+        return configs
+
     while True:
         action = await show_menu(
             f"📁 Управление стеком ({stack_name}):",
             choices=[
                 {"name": "Редактировать конфигурацию стека", "value": "edit_config"},
-                {"name": "Добавить проект", "value": "add"},
+                {"name": "Добавить проект вручную", "value": "add"},
                 {"name": "Удалить проект", "value": "remove"},
                 {"name": "Сканировать папки", "value": "scan"}
             ],
-            back_text="← Назад"
+            back_text="[Назад]"
         )
         if action is None:
             break
@@ -325,24 +376,52 @@ async def edit_stack(configs: Dict, stack_name: str) -> Dict:
             try:
                 project_name = await questionary.text(
                     "Название проекта:",
-                    validate=lambda x: x.strip() != "" and x not in configs["stacks"][stack_name]["projects"]
+                    validate=lambda x: (
+                        True if x.strip() == "" else
+                        x.strip() != "" and x not in configs["stacks"][stack_name]["projects"]
+                    ),
+                    qmark=">",
+                    instruction="Введите уникальное название проекта (или оставьте пустым для отмены)"
                 ).ask_async()
                 if not project_name:
+                    print("ℹ️ Ввод отменён")
                     continue
 
+                print("ℹ️ Укажите путь к существующей директории")
                 project_path = await questionary.path(
                     "Путь к проекту:",
                     only_directories=True,
-                    validate=lambda x: Path(x).is_dir()
+                    validate=lambda x: Path(x).is_dir(),
+                    qmark=">"
                 ).ask_async()
                 if not project_path:
+                    print("ℹ️ Ввод отменён")
                     continue
 
-                configs["stacks"][stack_name]["projects"][project_name] = str(Path(project_path).resolve())
+                resolved_path = Path(project_path).resolve()
+                detected_stack = detect_stack(resolved_path, configs)
+                if detected_stack != stack_name:
+                    logger.warning(
+                        f"Проект {project_name} не соответствует стеку {stack_name}. "
+                        f"Обнаружен стек: {detected_stack or 'не определён'}"
+                    )
+                    print(
+                        f"⚠️ Предупреждение: Проект не содержит сигнатурных файлов для стека {stack_name}. "
+                        "Добавление всё равно возможно."
+                    )
+                    if not await questionary.confirm(
+                        "Продолжить добавление проекта?",
+                        default=False
+                    ).ask_async():
+                        continue
+
+                configs["stacks"][stack_name]["projects"][project_name] = str(resolved_path)
                 save_configs(configs)
+                logger.info(f"Проект '{project_name}' добавлен в стек {stack_name}")
                 print(f"✅ Проект '{project_name}' добавлен")
             except Exception as e:
                 logger.error(f"Ошибка при добавлении проекта: {e}")
+                print(f"⚠️ Ошибка при добавлении проекта: {e}")
 
         elif action == "remove":
             if not configs["stacks"][stack_name]["projects"]:
@@ -352,14 +431,15 @@ async def edit_stack(configs: Dict, stack_name: str) -> Dict:
             project = await show_menu(
                 "Выберите проект для удаления:",
                 choices=[{"name": k, "value": k} for k in configs["stacks"][stack_name]["projects"]],
-                back_text="← Назад"
+                back_text="[Назад]"
             )
             if project is None:
                 continue
 
             del configs["stacks"][stack_name]["projects"][project]
             save_configs(configs)
-            print(f"✅ Проект '{project}' удален")
+            logger.info(f"Проект '{project}' удалён из стека {stack_name}")
+            print(f"✅ Проект '{project}' удалён")
 
         elif action == "scan":
             found = find_projects(configs)
@@ -370,8 +450,10 @@ async def edit_stack(configs: Dict, stack_name: str) -> Dict:
                         configs["stacks"][stack_name]["projects"][name] = path
                         count += 1
                 save_configs(configs)
+                logger.info(f"Добавлено {count} проектов в стек {stack_name}")
                 print(f"✅ Добавлено {count} проектов")
             else:
+                logger.info(f"Новые проекты для стека {stack_name} не найдены")
                 print("⚠️ Новые проекты не найдены")
     return configs
 
@@ -408,10 +490,14 @@ async def export_flow(configs: Dict) -> None:
         stack_name = await show_menu(
             "📦 Выберите стек:",
             choices=[{"name": k, "value": k} for k in configs["stacks"]],
-            back_text="← Назад"
+            back_text="[Назад]"
         )
         if stack_name is None:
             break
+
+        if stack_name not in configs["stacks"]:
+            print(f"⚠️ Стек '{stack_name}' не существует")
+            continue
 
         if not configs["stacks"][stack_name]["projects"]:
             print("⚠️ В этом стеке нет проектов. Добавьте их через меню управления конфигами.")
@@ -423,13 +509,14 @@ async def export_flow(configs: Dict) -> None:
         project_name = await show_menu(
             "Выберите проект:",
             choices=project_choices,
-            back_text="← Назад к стекам"
+            back_text="[Назад к стекам]"
         )
         if project_name is None:
             continue
 
         try:
-            if project_name is None:  # Ручной ввод
+            if project_name is None:
+                print("ℹ️ Укажите путь к существующей директории")
                 project_path = await questionary.path(
                     "Укажите путь к проекту:",
                     only_directories=True,
@@ -440,7 +527,6 @@ async def export_flow(configs: Dict) -> None:
             else:
                 project_path = configs["stacks"][stack_name]["projects"][project_name]
 
-            # Построение структуры проекта
             tree = build_project_tree(
                 Path(project_path),
                 configs["stacks"][stack_name]["extensions"],
@@ -448,9 +534,8 @@ async def export_flow(configs: Dict) -> None:
             )
             tree.insert(0, {"name": "📁 Весь проект", "value": {"type": "all", "path": str(project_path)}})
 
-            # Выбор папок/файлов для экспорта
             selected_items = await questionary.checkbox(
-                "Выберите папки/файлов для экспорта:",
+                "Выберите папки/файлы для экспорта:",
                 choices=tree,
                 qmark=">",
                 pointer="→"
@@ -458,7 +543,6 @@ async def export_flow(configs: Dict) -> None:
 
             logger.debug(f"Результат выбора: {selected_items}")
 
-            # Проверка результата выбора
             if selected_items is None or not isinstance(selected_items, list):
                 print("⚠️ Выбор отменён или ничего не выбрано")
                 continue
@@ -466,14 +550,12 @@ async def export_flow(configs: Dict) -> None:
                 print("⚠️ Не выбраны папки/файлы для экспорта")
                 continue
 
-            # Определение выбранных путей
             selected_paths = []
             for item in selected_items:
                 logger.debug(f"Обрабатывается выбранный элемент: {item}")
                 if item["type"] == "file":
                     selected_paths.append(item["relative"])
                 elif item["type"] == "directory":
-                    # Добавить все файлы из выбранной директории
                     dir_path = Path(item["path"])
                     exclude_dirs_lower = [d.lower() for d in configs["stacks"][stack_name]["exclude_dirs"]]
                     for root, _, files in os.walk(dir_path):
@@ -488,10 +570,9 @@ async def export_flow(configs: Dict) -> None:
                                 selected_paths.append(relative_path)
                                 logger.debug(f"Добавлен файл из директории: {relative_path}")
                 elif item["type"] == "all":
-                    selected_paths = None  # Null означает экспорт всего проекта
+                    selected_paths = None
                     break
 
-            # Выбор уровня вложенности
             max_depth = await questionary.text(
                 "Укажите максимальный уровень вложенности (оставьте пустым для полного экспорта):",
                 validate=lambda x: x.strip() == "" or (x.isdigit() and int(x) >= 0),
@@ -542,7 +623,7 @@ async def main_flow() -> None:
                 {"name": "Автопоиск проектов", "value": "discover"},
                 {"name": "Настройки сканирования", "value": "scan_dirs"}
             ],
-            back_text="🚪 Выход"
+            back_text="[Выход]"
         )
         if action is None:
             break
@@ -561,7 +642,7 @@ async def main_flow() -> None:
                         {"name": "Создать новый стек", "value": "new_stack"},
                         {"name": "Редактировать стек", "value": "edit_stack"}
                     ],
-                    back_text="← Назад"
+                    back_text="[Назад]"
                 )
                 if config_action is None:
                     break
@@ -572,7 +653,7 @@ async def main_flow() -> None:
                     stack_name = await show_menu(
                         "Выберите стек для редактирования:",
                         choices=[{"name": k, "value": k} for k in configs["stacks"]],
-                        back_text="← Назад"
+                        back_text="[Назад]"
                     )
                     if stack_name is None:
                         continue
@@ -602,5 +683,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nℹ Программа завершена пользователем")
     except Exception as e:
-        logger.critical(f"Критическая ошибка: {e}")
+        logger.critical(f"Критическая ошибка: {str(e)}")
         print("⚠️ Произошла критическая ошибка. Подробности в логах.")
